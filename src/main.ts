@@ -13,7 +13,7 @@ import {
   type MotionLoadProgress,
   type MotionVariant,
 } from './motion';
-import { setStateKinematic, DEFAULT_CONTROLLER_OPTIONS, type ControllerOptions } from './controller';
+import { applyPDControl, setStateKinematic, DEFAULT_CONTROLLER_OPTIONS, type ControllerOptions } from './controller';
 import { CameraWindow } from './cameras';
 import { RealTimePlot } from './plots';
 import { PolicyController } from './phpPolicyController.js';
@@ -33,7 +33,7 @@ const BUILTIN_MOTIONS = [
 ];
 
 type ModelId = 'sonic' | 'php';
-type PlayMode = 'kinematic' | 'sonic';
+type PlayMode = 'kinematic' | 'reference' | 'sonic';
 
 interface DynamicsStats {
   steps: number;
@@ -326,7 +326,7 @@ async function init() {
     activeModelId,
     initialPlaying: isPlaying,
     onPlayPause: () => {
-      if (!motion && playMode === 'kinematic') {
+      if (!motion && playMode !== 'sonic') {
         ui.motionStatusEl.textContent = 'No reference selected. Upload an NPZ/JSON or choose a built-in motion.';
         return isPlaying;
       }
@@ -344,7 +344,7 @@ async function init() {
       phpPolicyStepCounter = 0;
       sonicPolicy.reset(mjScene.model, mjScene.data);
       resetDynamicsStats(dynamicsStats, playMode, controllerOptions.rootAssist);
-      if (motion && playMode === 'kinematic') {
+      if (motion && (playMode === 'kinematic' || playMode === 'reference')) {
         applyMotionReference(0);
       } else if (activeModelId === 'sonic' && playMode === 'sonic') {
         sonicPolicy.setInitialStandingState(mjScene.model, mjScene.data);
@@ -362,12 +362,14 @@ async function init() {
       if (mode === 'sonic') {
         simTime = currentTime;
         sonicPolicy.setInitialStandingState(mjScene.model, mjScene.data);
+      } else if (mode === 'reference') {
+        simTime = currentTime;
       } else {
         currentTime = simTime;
       }
       playMode = mode;
       resetDynamicsStats(dynamicsStats, playMode, controllerOptions.rootAssist);
-      if (motion && mode === 'kinematic') {
+      if (motion && (mode === 'kinematic' || mode === 'reference')) {
         applyMotionReference(currentTime);
       } else if (!motion && mode === 'kinematic') {
         resetModelState(mjScene, mujoco, activeProfile);
@@ -381,6 +383,10 @@ async function init() {
       uploadedVariants = await loadMotionVariantsFromFile(file, onProgress);
       if (!uploadedVariants.length) throw new Error('No playable motion found in file.');
       setActiveMotion(uploadedVariants[0].motion, uploadedVariants[0].label);
+      if (activeModelId === 'sonic') {
+        playMode = 'reference';
+        resetDynamicsStats(dynamicsStats, playMode, controllerOptions.rootAssist);
+      }
       return uploadedVariants;
     },
     onUploadedVariant: (index) => {
@@ -565,7 +571,7 @@ async function init() {
     sonicPolicy.reset(mjScene.model, mjScene.data);
     resetDynamicsStats(dynamicsStats, playMode, controllerOptions.rootAssist);
     updateMotionUI(motion);
-    if (playMode === 'kinematic') applyMotionReference(0);
+    if (playMode === 'kinematic' || playMode === 'reference') applyMotionReference(0);
   }
 
   function clearMotion() {
@@ -622,7 +628,7 @@ async function init() {
     if (motion && isPlaying) {
       if (playMode === 'kinematic') {
         currentTime += dt * playSpeed;
-        if (currentTime > motion.duration) currentTime = 0;
+        if (currentTime > motion.duration) currentTime = motion.duration;
         const ref = sampleMotion(motion, currentTime);
         latestReference = ref;
         setStateKinematic(mjScene.model, mjScene.data, ref.qpos, ref.qvel);
@@ -631,6 +637,26 @@ async function init() {
         dynamicsStats.rootAssist = controllerOptions.rootAssist;
         dynamicsStats.ctrlRms = 0;
         dynamicsStats.ctrlMax = 0;
+      } else if (playMode === 'reference') {
+        const step = mjScene.model.opt.timestep;
+        const targetSimTime = simTime + dt * playSpeed;
+        let steps = 0;
+        while (simTime < targetSimTime && steps < 20) {
+          const ref = sampleReference(simTime);
+          if (!ref) break;
+          latestReference = ref;
+          applyPDControl(mujoco, mjScene.model, mjScene.data, ref.qpos, ref.qvel, controllerOptions);
+          if (controllerOptions.rootAssist) stabilizeRootToReference(simTime);
+          updateControlStats(dynamicsStats, mjScene.data, mjScene.model.nu);
+          mujoco.mj_step(mjScene.model, mjScene.data);
+          dynamicsStats.steps += 1;
+          dynamicsStats.mode = playMode;
+          dynamicsStats.rootAssist = controllerOptions.rootAssist;
+          mujoco.mj_forward(mjScene.model, mjScene.data);
+          simTime += step;
+          steps++;
+        }
+        currentTime = Math.min(simTime, motion.duration);
       } else {
         // Sonic dynamics: keep MuJoCo live and let the policy continuously emit joint targets.
         const step = mjScene.model.opt.timestep;
@@ -836,22 +862,32 @@ function buildUI(c: UIControls) {
   const modeRow = document.createElement('div');
   modeRow.className = 'flex gap-2';
   const kinBtn = document.createElement('button');
-  kinBtn.className = 'glass-button active flex-1';
-  kinBtn.textContent = 'Kinematic';
-  const simBtn = document.createElement('button');
-  simBtn.className = 'glass-button flex-1';
-  simBtn.textContent = 'WBC Dynamics';
+  kinBtn.className = 'glass-button active flex-1 px-3 text-xs whitespace-nowrap';
+  kinBtn.textContent = 'Kin';
+  const refDynBtn = document.createElement('button');
+  refDynBtn.className = 'glass-button flex-1 px-3 text-xs whitespace-nowrap';
+  refDynBtn.textContent = 'Ref Dyn';
+  const policyBtn = document.createElement('button');
+  policyBtn.className = 'glass-button flex-1 px-3 text-xs whitespace-nowrap';
+  policyBtn.textContent = 'Stand';
+  const setModeButtons = (mode: PlayMode) => {
+    kinBtn.classList.toggle('active', mode === 'kinematic');
+    refDynBtn.classList.toggle('active', mode === 'reference');
+    policyBtn.classList.toggle('active', mode === 'sonic');
+  };
   kinBtn.onclick = () => {
     c.onModeChange('kinematic');
-    kinBtn.classList.add('active');
-    simBtn.classList.remove('active');
+    setModeButtons('kinematic');
   };
-  simBtn.onclick = () => {
+  refDynBtn.onclick = () => {
+    c.onModeChange('reference');
+    setModeButtons('reference');
+  };
+  policyBtn.onclick = () => {
     c.onModeChange('sonic');
-    simBtn.classList.add('active');
-    kinBtn.classList.remove('active');
+    setModeButtons('sonic');
   };
-  modeRow.append(kinBtn, simBtn);
+  modeRow.append(kinBtn, refDynBtn, policyBtn);
 
   const speedRow = document.createElement('div');
   speedRow.className = 'flex items-center gap-2 text-sm';
@@ -924,6 +960,7 @@ function buildUI(c: UIControls) {
         const totalMb = progress.total / (1024 * 1024);
         motionStatusEl.textContent = `${progress.phase} ${file.name} · ${loadedMb.toFixed(1)} / ${totalMb.toFixed(1)} MB`;
       });
+      setModeButtons('reference');
       uploadedOption.hidden = false;
       uploadedOption.textContent = `Uploaded: ${file.name}`;
       motionSelect.value = '__uploaded__';
@@ -1006,11 +1043,11 @@ function buildUI(c: UIControls) {
   };
   const sonicUploadBtn = document.createElement('button');
   sonicUploadBtn.className = 'glass-button w-full';
-  sonicUploadBtn.textContent = 'Load Sonic encoder/decoder';
+  sonicUploadBtn.textContent = 'Override Sonic ONNX';
   sonicUploadBtn.onclick = () => sonicInput.click();
   const sonicStatusEl = document.createElement('div');
   sonicStatusEl.className = 'text-[11px] leading-snug text-slate-400 max-w-[320px] break-words';
-  sonicStatusEl.textContent = 'ONNX not loaded; Sonic policy loop not wired';
+  sonicStatusEl.textContent = 'Bundled Sonic ONNX loading automatically...';
   sonicOnnxRow.append(sonicInput, sonicUploadBtn, sonicStatusEl);
 
   playbackPanel.append(row1, modelRow);
@@ -1033,7 +1070,7 @@ function buildUI(c: UIControls) {
   stabilityEl.textContent = 'height -- · tilt -- · mode free root';
   const dynamicsEl = document.createElement('div');
   dynamicsEl.className = 'text-xs leading-snug text-slate-400';
-  dynamicsEl.textContent = 'kinematic qpos · ref motion · steps 0 · ctrl 0.0';
+  dynamicsEl.textContent = 'kinematic qpos · ref none · steps 0 · ctrl 0.0';
   optionsPanel.append(kpRow, kdRow, maxTorqueRow, rootAssistRow, stabilityEl, dynamicsEl);
 
   const phpOptionsPanel = document.createElement('div');
@@ -1116,8 +1153,10 @@ function resetDynamicsStats(stats: DynamicsStats, mode: PlayMode, rootAssist: bo
 
 function updateDynamicsReadout(element: HTMLElement, stats: DynamicsStats) {
   const mode = stats.mode === 'sonic'
-    ? stats.rootAssist ? 'mj_step + root assist' : 'free-root mj_step'
-    : 'kinematic qpos';
+    ? 'policy stand mj_step'
+    : stats.mode === 'reference'
+      ? stats.rootAssist ? 'ref PD mj_step + root assist' : 'ref PD free-root mj_step'
+      : 'kinematic qpos';
   element.textContent = `${mode} · ref ${stats.reference} · steps ${stats.steps} · ctrl rms ${stats.ctrlRms.toFixed(1)} max ${stats.ctrlMax.toFixed(1)}`;
 }
 
