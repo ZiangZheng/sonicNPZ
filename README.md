@@ -9,15 +9,17 @@ not need to be committed to this repository.
 
 ## GitHub Pages
 
-This repo deploys through `.github/workflows/pages.yml`. After pushing to
-`main`, the published page is:
+This repo deploys through `.github/workflows/pages.yml`, which builds `main`
+and publishes `dist/` to the `gh-pages` branch. After pushing to `main`, the
+published page is:
 
 ```text
 https://ziangzheng.github.io/sonicNPZ/
 ```
 
-If the first deployment does not start, enable GitHub Pages for this repository
-with source `GitHub Actions` in the repository settings.
+For a new repository, enable GitHub Pages once in the repository settings:
+`Settings -> Pages -> Build and deployment -> Deploy from a branch`, then select
+`gh-pages` and `/ (root)`.
 
 ## Local Run
 
