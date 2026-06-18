@@ -245,9 +245,13 @@ function humanIdmNpzToMotion(arrays: Map<string, NpyArray>, prefix: string, sour
     row[4] = 0;
     row[5] = 0;
     row[6] = 0;
-    row.set(lower[i].subarray(0, 15), 7);
-    row.set(leftArm[i].subarray(0, 7), 7 + 15);
-    row.set(rightArm[i].subarray(0, 7), 7 + 22);
+    // HumanIDM lower_qpos layout is waist(3), left_leg(6), right_leg(6).
+    // MuJoCo G1 qpos layout is left_leg(6), right_leg(6), waist(3), left_arm(7), right_arm(7).
+    row.set(lower[i].subarray(3, 9), 7);
+    row.set(lower[i].subarray(9, 15), 13);
+    row.set(lower[i].subarray(0, 3), 19);
+    row.set(leftArm[i].subarray(0, 7), 22);
+    row.set(rightArm[i].subarray(0, 7), 29);
     return row;
   });
   const qvel = estimateQvel(qpos, fps);
