@@ -1,0 +1,26 @@
+{
+  "name": "sonic-npz-pages",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3",
+    "vite": "^8.0.12"
+  },
+  "dependencies": {
+    "@mujoco/mujoco": "^3.9.0",
+    "@tailwindcss/vite": "^4.3.1",
+    "@types/three": "^0.184.1",
+    "chart.js": "^4.5.1",
+    "fflate": "^0.8.3",
+    "onnxruntime-web": "^1.26.0",
+    "tailwindcss": "^4.3.1",
+    "three": "^0.184.0",
+    "urdf-loader": "^0.12.6"
+  }
+}
