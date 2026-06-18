@@ -5,7 +5,14 @@ import loadMujoco from '@mujoco/mujoco';
 import wasmUrl from '@mujoco/mujoco/mujoco.wasm?url';
 
 import { loadMuJoCoScene, updateSceneTransforms, getBodyWorldTransform, type MuJoCoScene } from './mujocoScene';
-import { loadMotionFromURL, loadMotionFromFile, sampleMotion, type MotionClip } from './motion';
+import {
+  loadMotionFromURL,
+  loadMotionVariantsFromFile,
+  sampleMotion,
+  type MotionClip,
+  type MotionLoadProgress,
+  type MotionVariant,
+} from './motion';
 import { setStateKinematic, DEFAULT_CONTROLLER_OPTIONS, type ControllerOptions } from './controller';
 import { CameraWindow } from './cameras';
 import { RealTimePlot } from './plots';
@@ -34,7 +41,7 @@ interface DynamicsStats {
   ctrlMax: number;
   mode: PlayMode;
   rootAssist: boolean;
-  reference: 'motion' | 'stand';
+  reference: 'motion' | 'stand' | 'none';
 }
 
 interface ModelProfile {
@@ -65,7 +72,6 @@ const MODEL_PROFILES: Record<ModelId, ModelProfile> = {
     label: 'Sonic',
     sceneUrl: './assets/g1_wbc/g1_gear_wbc.xml',
     meshBaseUrl: './assets/g1_wbc/meshes/',
-    defaultMotionUrl: DEFAULT_MOTION_URL,
   },
   php: {
     id: 'php',
@@ -287,7 +293,9 @@ async function init() {
   // State.
   let motion: MotionClip | null = null;
   let standMotion: MotionClip | null = null;
-  let isPlaying = true;
+  let uploadedVariants: MotionVariant[] = [];
+  let activeMotionLabel = 'No reference';
+  let isPlaying = false;
   let playMode: PlayMode = 'kinematic';
   let playSpeed = 1.0;
   let currentTime = 0;
@@ -308,7 +316,7 @@ async function init() {
     ctrlMax: 0,
     mode: playMode,
     rootAssist: controllerOptions.rootAssist,
-    reference: 'motion',
+    reference: 'none',
   };
   const sonicPolicy = new SonicPolicyController(mujoco);
   let sonicPolicyReady = false;
@@ -318,7 +326,12 @@ async function init() {
     activeModelId,
     initialPlaying: isPlaying,
     onPlayPause: () => {
+      if (!motion && playMode === 'kinematic') {
+        ui.motionStatusEl.textContent = 'No reference selected. Upload an NPZ/JSON or choose a built-in motion.';
+        return isPlaying;
+      }
       isPlaying = !isPlaying;
+      return isPlaying;
     },
     onModelChange: (modelId) => {
       const params = new URLSearchParams(window.location.search);
@@ -356,26 +369,29 @@ async function init() {
       resetDynamicsStats(dynamicsStats, playMode, controllerOptions.rootAssist);
       if (motion && mode === 'kinematic') {
         applyMotionReference(currentTime);
+      } else if (!motion && mode === 'kinematic') {
+        resetModelState(mjScene, mujoco, activeProfile);
       }
     },
     onSpeedChange: (s) => (playSpeed = s),
-    onFile: async (file) => {
-      motion = await loadMotionFromFile(file);
-      currentTime = 0;
-      simTime = 0;
-      sonicPolicy.reset(mjScene.model, mjScene.data);
-      resetDynamicsStats(dynamicsStats, playMode, controllerOptions.rootAssist);
-      updateMotionUI(motion);
-      if (playMode === 'kinematic') applyMotionReference(0);
+    onClearMotion: () => {
+      clearMotion();
+    },
+    onFile: async (file, onProgress) => {
+      uploadedVariants = await loadMotionVariantsFromFile(file, onProgress);
+      if (!uploadedVariants.length) throw new Error('No playable motion found in file.');
+      setActiveMotion(uploadedVariants[0].motion, uploadedVariants[0].label);
+      return uploadedVariants;
+    },
+    onUploadedVariant: (index) => {
+      const variant = uploadedVariants[index];
+      if (variant) setActiveMotion(variant.motion, variant.label);
     },
     onBuiltinMotion: async (url) => {
-      motion = await loadMotionFromURL(url);
-      currentTime = 0;
-      simTime = 0;
-      sonicPolicy.reset(mjScene.model, mjScene.data);
-      resetDynamicsStats(dynamicsStats, playMode, controllerOptions.rootAssist);
-      updateMotionUI(motion);
-      if (playMode === 'kinematic') applyMotionReference(0);
+      const builtin = BUILTIN_MOTIONS.find((item) => item.url === url);
+      const loaded = await loadMotionFromURL(url);
+      setActiveMotion(loaded, builtin?.label ?? url);
+      return loaded;
     },
     onSonicFiles: async (files) => {
       if (!ui.sonicStatusEl) return;
@@ -486,22 +502,20 @@ async function init() {
     ['#00bcd4', '#3870e8'],
   ) : null;
 
-  if (activeProfile.defaultMotionUrl) {
-    Promise.all([
-      loadMotionFromURL(activeProfile.defaultMotionUrl),
-      loadMotionFromURL(STAND_MOTION_URL),
-    ]).then(([m, stand]) => {
-      motion = m;
+  if (activeModelId === 'sonic') {
+    loadMotionFromURL(STAND_MOTION_URL).then((stand) => {
       standMotion = stand;
-      updateMotionUI(motion);
-      applyMotionReference(0);
+    }).catch((err: unknown) => {
+      console.error('Failed to load Sonic stand reference:', err);
     });
-  } else {
-    resetModelState(mjScene, mujoco, activeProfile);
   }
+  resetModelState(mjScene, mujoco, activeProfile);
 
   function sampleReference(time: number) {
-    if (!motion) return;
+    if (!motion) {
+      dynamicsStats.reference = 'none';
+      return;
+    }
     const useStand = time > motion.duration;
     const ref = useStand && standMotion
       ? sampleMotion(standMotion, 0)
@@ -534,9 +548,41 @@ async function init() {
   }
 
   function updateMotionUI(m: MotionClip) {
+    ui.motionStatusEl.textContent = `${activeMotionLabel} · ${m.times.length} frames · ${m.fps.toFixed(1)} fps`;
     ui.durationEl.textContent = `${m.duration.toFixed(2)}s`;
     ui.timeSlider.max = String(m.duration);
-    ui.timeSlider.step = String(m.duration / 1000);
+    ui.timeSlider.step = String(Math.max(m.duration / 1000, 0.001));
+    ui.timeSlider.value = '0';
+    ui.timeDisplay.textContent = '0.00s';
+  }
+
+  function setActiveMotion(nextMotion: MotionClip, label: string) {
+    motion = nextMotion;
+    activeMotionLabel = label;
+    currentTime = 0;
+    simTime = 0;
+    latestReference = null;
+    sonicPolicy.reset(mjScene.model, mjScene.data);
+    resetDynamicsStats(dynamicsStats, playMode, controllerOptions.rootAssist);
+    updateMotionUI(motion);
+    if (playMode === 'kinematic') applyMotionReference(0);
+  }
+
+  function clearMotion() {
+    motion = null;
+    activeMotionLabel = 'No reference';
+    currentTime = 0;
+    simTime = 0;
+    latestReference = null;
+    resetDynamicsStats(dynamicsStats, playMode, controllerOptions.rootAssist);
+    dynamicsStats.reference = 'none';
+    ui.durationEl.textContent = '0.00s';
+    ui.timeSlider.max = '1';
+    ui.timeSlider.step = '0.01';
+    ui.timeSlider.value = '0';
+    ui.timeDisplay.textContent = '0.00s';
+    ui.motionStatusEl.textContent = 'No reference selected.';
+    resetModelState(mjScene, mujoco, activeProfile);
   }
 
   function updateMainCamera() {
@@ -613,7 +659,27 @@ async function init() {
 
       ui.timeSlider.value = String(currentTime);
       ui.timeDisplay.textContent = `${currentTime.toFixed(2)}s`;
-    } else if (!motion && isPlaying) {
+    } else if (!motion && isPlaying && activeModelId === 'sonic' && playMode === 'sonic') {
+      const step = mjScene.model.opt.timestep;
+      const targetSimTime = simTime + dt * playSpeed;
+      let steps = 0;
+      dynamicsStats.reference = 'stand';
+      while (simTime < targetSimTime && steps < 20) {
+        if (!sonicPolicyReady) break;
+        await sonicPolicy.maybeUpdateAction(mjScene.model, mjScene.data).catch((err: unknown) => {
+          console.error('Sonic policy inference error:', err);
+        });
+        sonicPolicy.applyControl(mjScene.model, mjScene.data);
+        updateControlStats(dynamicsStats, mjScene.data, mjScene.model.nu);
+        mujoco.mj_step(mjScene.model, mjScene.data);
+        dynamicsStats.steps += 1;
+        dynamicsStats.mode = playMode;
+        dynamicsStats.rootAssist = controllerOptions.rootAssist;
+        mujoco.mj_forward(mjScene.model, mjScene.data);
+        simTime += step;
+        steps++;
+      }
+    } else if (!motion && isPlaying && activeProfile.policy) {
       const step = mjScene.model.opt.timestep;
       const targetSimTime = simTime + dt * playSpeed;
       let steps = 0;
@@ -693,13 +759,15 @@ async function init() {
 interface UIControls {
   activeModelId: ModelId;
   initialPlaying: boolean;
-  onPlayPause: () => void;
+  onPlayPause: () => boolean;
   onReset: () => void;
   onModelChange: (modelId: ModelId) => void;
   onModeChange: (mode: PlayMode) => void;
   onSpeedChange: (speed: number) => void;
-  onFile: (file: File) => void;
-  onBuiltinMotion: (url: string) => void;
+  onClearMotion: () => void;
+  onFile: (file: File, onProgress: (progress: MotionLoadProgress) => void) => Promise<MotionVariant[]>;
+  onUploadedVariant: (index: number) => void;
+  onBuiltinMotion: (url: string) => Promise<MotionClip>;
   onSonicFiles: (files: FileList) => void;
   onKpChange: (kp: number) => void;
   onKdChange: (kd: number) => void;
@@ -742,9 +810,9 @@ function buildUI(c: UIControls) {
   playBtn.className = c.initialPlaying ? 'glass-button active' : 'glass-button';
   playBtn.textContent = c.initialPlaying ? 'Pause' : 'Play';
   playBtn.onclick = () => {
-    c.onPlayPause();
-    playBtn.textContent = playBtn.textContent === 'Pause' ? 'Play' : 'Pause';
-    playBtn.classList.toggle('active');
+    const playing = c.onPlayPause();
+    playBtn.textContent = playing ? 'Pause' : 'Play';
+    playBtn.classList.toggle('active', playing);
   };
   const resetBtn = document.createElement('button');
   resetBtn.className = 'glass-button';
@@ -826,31 +894,105 @@ function buildUI(c: UIControls) {
   timeRow.append(timeDisplay, timeSlider, durationEl);
 
   const fileRow = document.createElement('div');
-  fileRow.className = 'flex items-center gap-2';
+  fileRow.className = 'flex flex-col gap-2';
   const fileInput = document.createElement('input');
   fileInput.type = 'file';
   fileInput.accept = '.json,.npz';
   fileInput.className = 'hidden';
-  fileInput.onchange = () => {
-    if (fileInput.files?.length) c.onFile(fileInput.files[0]);
-  };
   const uploadBtn = document.createElement('button');
   uploadBtn.className = 'glass-button w-full';
   uploadBtn.textContent = 'Upload reference motion';
+  const uploadProgress = document.createElement('div');
+  uploadProgress.className = 'upload-progress hidden';
+  const uploadProgressFill = document.createElement('div');
+  uploadProgress.append(uploadProgressFill);
+  const motionStatusEl = document.createElement('div');
+  motionStatusEl.className = 'text-[11px] leading-snug text-slate-400 max-w-[320px] break-words';
+  motionStatusEl.textContent = 'No reference selected.';
+  fileInput.onchange = async () => {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    uploadBtn.disabled = true;
+    uploadBtn.textContent = 'Loading...';
+    uploadProgress.classList.remove('hidden');
+    uploadProgressFill.style.width = '0%';
+    motionStatusEl.textContent = `Reading ${file.name}...`;
+    try {
+      const variants = await c.onFile(file, (progress) => {
+        uploadProgressFill.style.width = `${Math.round(progress.ratio * 100)}%`;
+        const loadedMb = progress.loaded / (1024 * 1024);
+        const totalMb = progress.total / (1024 * 1024);
+        motionStatusEl.textContent = `${progress.phase} ${file.name} · ${loadedMb.toFixed(1)} / ${totalMb.toFixed(1)} MB`;
+      });
+      uploadedOption.hidden = false;
+      uploadedOption.textContent = `Uploaded: ${file.name}`;
+      motionSelect.value = '__uploaded__';
+      trackSelect.innerHTML = variants.map((variant, index) =>
+        `<option value="${index}">${variant.label}</option>`,
+      ).join('');
+      trackRow.classList.toggle('hidden', variants.length <= 1);
+      trackSelect.value = '0';
+      const first = variants[0].motion;
+      motionStatusEl.textContent = `${variants[0].label} · ${first.times.length} frames · ${first.duration.toFixed(2)}s · ready`;
+    } catch (error) {
+      console.error('Failed to load reference motion:', error);
+      motionStatusEl.textContent = error instanceof Error ? error.message : String(error);
+      uploadProgressFill.style.width = '0%';
+    } finally {
+      uploadBtn.disabled = false;
+      uploadBtn.textContent = 'Upload reference motion';
+      fileInput.value = '';
+    }
+  };
   uploadBtn.onclick = () => fileInput.click();
-  fileRow.append(fileInput, uploadBtn);
+  fileRow.append(fileInput, uploadBtn, uploadProgress, motionStatusEl);
 
   const builtinRow = document.createElement('div');
   builtinRow.className = 'flex items-center gap-2 text-sm';
   builtinRow.innerHTML = '<span class="text-slate-300 w-14">Motion</span>';
   const builtinSelect = document.createElement('select');
-  builtinSelect.className = 'glass-input flex-1';
-  builtinSelect.innerHTML = BUILTIN_MOTIONS.map((motion) =>
-    `<option value="${motion.url}">${motion.label}</option>`,
-  ).join('');
-  builtinSelect.value = DEFAULT_MOTION_URL;
-  builtinSelect.onchange = () => c.onBuiltinMotion(builtinSelect.value);
-  builtinRow.append(builtinSelect);
+  const motionSelect = builtinSelect;
+  motionSelect.className = 'glass-input flex-1';
+  motionSelect.innerHTML = [
+    '<option value="__none__">No reference</option>',
+    ...BUILTIN_MOTIONS.map((motionItem) => `<option value="${motionItem.url}">${motionItem.label}</option>`),
+    '<option value="__uploaded__" hidden>Uploaded file</option>',
+  ].join('');
+  const uploadedOption = motionSelect.querySelector('option[value="__uploaded__"]') as HTMLOptionElement;
+  motionSelect.value = '__none__';
+  motionSelect.onchange = async () => {
+    const value = motionSelect.value;
+    trackRow.classList.add('hidden');
+    if (value === '__none__') {
+      c.onClearMotion();
+      return;
+    }
+    if (value === '__uploaded__') {
+      trackRow.classList.toggle('hidden', trackSelect.options.length <= 1);
+      c.onUploadedVariant(Number(trackSelect.value || 0));
+      return;
+    }
+    motionStatusEl.textContent = 'Loading built-in motion...';
+    try {
+      const loaded = await c.onBuiltinMotion(value);
+      motionStatusEl.textContent = `${motionSelect.selectedOptions[0]?.textContent ?? value} · ${loaded.times.length} frames · ${loaded.duration.toFixed(2)}s · ready`;
+    } catch (error) {
+      console.error('Failed to load built-in motion:', error);
+      motionStatusEl.textContent = error instanceof Error ? error.message : String(error);
+    }
+  };
+  builtinRow.append(motionSelect);
+
+  const trackRow = document.createElement('div');
+  trackRow.className = 'hidden flex items-center gap-2 text-sm';
+  trackRow.innerHTML = '<span class="text-slate-300 w-14">Track</span>';
+  const trackSelect = document.createElement('select');
+  trackSelect.className = 'glass-input flex-1';
+  trackSelect.onchange = () => {
+    c.onUploadedVariant(Number(trackSelect.value));
+    motionStatusEl.textContent = `Selected ${trackSelect.selectedOptions[0]?.textContent ?? 'uploaded track'}`;
+  };
+  trackRow.append(trackSelect);
 
   const sonicOnnxRow = document.createElement('div');
   sonicOnnxRow.className = 'flex flex-col gap-2';
@@ -874,7 +1016,7 @@ function buildUI(c: UIControls) {
   playbackPanel.append(row1, modelRow);
   if (isSonic) playbackPanel.append(modeRow);
   playbackPanel.append(speedRow);
-  if (isSonic) playbackPanel.append(builtinRow, timeRow, fileRow, sonicOnnxRow);
+  if (isSonic) playbackPanel.append(builtinRow, trackRow, timeRow, fileRow, sonicOnnxRow);
 
   // Options panel.
   const optionsPanel = document.createElement('div');
@@ -942,6 +1084,7 @@ function buildUI(c: UIControls) {
     rootHeightCanvas: plotsPanel.querySelector('#root-height-canvas') as HTMLCanvasElement | null,
     policyStatusEl: phpOptionsPanel.querySelector('#policy-status') as HTMLDivElement | null,
     sonicStatusEl,
+    motionStatusEl,
     stabilityEl,
     dynamicsEl,
     timeDisplay,
@@ -968,7 +1111,7 @@ function resetDynamicsStats(stats: DynamicsStats, mode: PlayMode, rootAssist: bo
   stats.ctrlMax = 0;
   stats.mode = mode;
   stats.rootAssist = rootAssist;
-  stats.reference = 'motion';
+  stats.reference = 'none';
 }
 
 function updateDynamicsReadout(element: HTMLElement, stats: DynamicsStats) {

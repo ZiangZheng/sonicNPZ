@@ -4,6 +4,7 @@ export interface MotionClip {
   fps: number;
   duration: number;
   jointNames: string[];
+  sourceName?: string;
   times: Float32Array;
   qpos: Float32Array[];
   qvel: Float32Array[];
@@ -13,30 +14,69 @@ export interface MotionClip {
   rightHandCmd?: Float32Array[];
 }
 
+export interface MotionVariant {
+  id: string;
+  label: string;
+  motion: MotionClip;
+}
+
+export interface MotionLoadProgress {
+  phase: 'reading' | 'parsing' | 'ready';
+  loaded: number;
+  total: number;
+  ratio: number;
+}
+
 export async function loadMotionFromURL(url: string): Promise<MotionClip> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to load motion: ${url}`);
   if (/\.npz($|\?)/i.test(url)) {
-    return normalizeNpz(await res.arrayBuffer());
+    return normalizeNpzVariants(await res.arrayBuffer())[0].motion;
   }
   const json = await res.json();
   return normalizeMotion(json);
 }
 
-export function loadMotionFromFile(file: File): Promise<MotionClip> {
+export function loadMotionFromFile(
+  file: File,
+  onProgress?: (progress: MotionLoadProgress) => void,
+): Promise<MotionClip> {
+  return loadMotionVariantsFromFile(file, onProgress).then((variants) => variants[0].motion);
+}
+
+export function loadMotionVariantsFromFile(
+  file: File,
+  onProgress?: (progress: MotionLoadProgress) => void,
+): Promise<MotionVariant[]> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
       try {
+        onProgress?.({ phase: 'parsing', loaded: file.size, total: file.size, ratio: 1 });
         if (/\.npz$/i.test(file.name)) {
-          resolve(normalizeNpz(reader.result as ArrayBuffer));
+          const variants = normalizeNpzVariants(reader.result as ArrayBuffer);
+          onProgress?.({ phase: 'ready', loaded: file.size, total: file.size, ratio: 1 });
+          resolve(variants);
           return;
         }
         const json = JSON.parse(reader.result as string);
-        resolve(normalizeMotion(json));
+        const motion = normalizeMotion(json);
+        motion.sourceName = file.name;
+        onProgress?.({ phase: 'ready', loaded: file.size, total: file.size, ratio: 1 });
+        resolve([{ id: 'json', label: file.name, motion }]);
       } catch (e) {
         reject(e);
       }
+    };
+    reader.onprogress = (event) => {
+      const total = event.lengthComputable ? event.total : file.size;
+      const loaded = event.lengthComputable ? event.loaded : Math.min(file.size, event.loaded || 0);
+      onProgress?.({
+        phase: 'reading',
+        loaded,
+        total,
+        ratio: total > 0 ? Math.max(0, Math.min(1, loaded / total)) : 0,
+      });
     };
     reader.onerror = reject;
     if (/\.npz$/i.test(file.name)) {
@@ -59,6 +99,7 @@ function normalizeMotion(raw: any): MotionClip {
     fps,
     duration,
     jointNames: raw.joint_names || [],
+    sourceName: raw.source_name,
     times,
     qpos,
     qvel,
@@ -124,7 +165,7 @@ export function sampleMotion(
   return { qpos: outQpos, qvel: outQvel, idx, alpha, leftHandCmd, rightHandCmd };
 }
 
-function normalizeNpz(buffer: ArrayBuffer): MotionClip {
+function normalizeNpzVariants(buffer: ArrayBuffer): MotionVariant[] {
   const files = unzipSync(new Uint8Array(buffer));
   const arrays = new Map<string, NpyArray>();
   for (const [name, bytes] of Object.entries(files)) {
@@ -134,7 +175,7 @@ function normalizeNpz(buffer: ArrayBuffer): MotionClip {
   }
 
   if (arrays.has('qpos')) {
-    return normalizeMotion({
+    const motion = normalizeMotion({
       fps: scalarNumber(arrays.get('fps')) || 30,
       times: matrixRows(arrays.get('times')),
       qpos: matrixRows(arrays.get('qpos')),
@@ -142,18 +183,50 @@ function normalizeNpz(buffer: ArrayBuffer): MotionClip {
       root_pos: matrixRows(arrays.get('root_pos')),
       root_quat: matrixRows(arrays.get('root_quat')),
       joint_names: [],
+      source_name: 'qpos',
     });
+    return [{ id: 'qpos', label: 'qpos', motion }];
   }
 
-  return humanIdmNpzToMotion(arrays);
+  const prefixes = detectHumanIdmPrefixes(arrays);
+  if (!prefixes.length) {
+    throw new Error('NPZ does not contain qpos or HumanIDM lower/arm arrays.');
+  }
+
+  return prefixes.map((prefix) => {
+    const label = labelHumanIdmPrefix(prefix);
+    return {
+      id: prefix,
+      label,
+      motion: humanIdmNpzToMotion(arrays, prefix, label),
+    };
+  });
 }
 
-function humanIdmNpzToMotion(arrays: Map<string, NpyArray>): MotionClip {
-  const prefix = arrays.has('gt_gt_lower_qpos')
-    ? 'gt_gt'
-    : arrays.has('pred100_pred_lower_qpos')
-      ? 'pred100_pred'
-      : 'pred50_pred';
+function detectHumanIdmPrefixes(arrays: Map<string, NpyArray>) {
+  const found = Array.from(arrays.keys())
+    .filter((name) => name.endsWith('_lower_qpos'))
+    .map((name) => name.replace(/_lower_qpos$/, ''))
+    .filter((prefix) =>
+      arrays.has(`${prefix}_left_arm_pose`) &&
+      arrays.has(`${prefix}_right_arm_pose`),
+    );
+  const preferred = ['gt_gt', 'relabel', 'relabel_gt', 'pred100_pred', 'pred50_pred'];
+  return [
+    ...preferred.filter((prefix) => found.includes(prefix)),
+    ...found.filter((prefix) => !preferred.includes(prefix)).sort(),
+  ];
+}
+
+function labelHumanIdmPrefix(prefix: string) {
+  if (prefix === 'gt_gt') return 'Ground truth (gt_gt)';
+  if (prefix === 'pred100_pred') return 'Relabel / pred100';
+  if (prefix === 'pred50_pred') return 'Relabel / pred50';
+  if (prefix.includes('relabel')) return `Relabel (${prefix})`;
+  return prefix;
+}
+
+function humanIdmNpzToMotion(arrays: Map<string, NpyArray>, prefix: string, sourceName: string): MotionClip {
   const lower = requireMatrix(arrays, `${prefix}_lower_qpos`);
   const leftArm = requireMatrix(arrays, `${prefix}_left_arm_pose`);
   const rightArm = requireMatrix(arrays, `${prefix}_right_arm_pose`);
@@ -183,6 +256,7 @@ function humanIdmNpzToMotion(arrays: Map<string, NpyArray>): MotionClip {
     fps,
     duration: n > 0 ? (n - 1) / fps : 0,
     jointNames: [],
+    sourceName,
     times,
     qpos,
     qvel,
